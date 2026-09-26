@@ -1,0 +1,70 @@
+[
+  {
+    "id": "eval-01-url-parse",
+    "title": "GitHub 仓库地址解析格式缺陷",
+    "issue_text": "【Bug】用户在终端传入形如 'git@github.com:owner/repo.git#123' 的 SSH 格式地址时，程序报错无法提取 issue 编号，请定位负责解析地址的代码文件并分析原因。",
+    "ground_truth": {
+      "target_files": [
+        "src/handle_github_url.py"
+      ],
+      "expected_keywords": [
+        "handle_url",
+        "re.search",
+        "正则",
+        "ssh"
+      ],
+      "difficulty": "easy"
+    }
+  },
+  {
+    "id": "eval-02-file-encoding",
+    "title": "文件读取工具未处理特殊字符与不存在路径",
+    "issue_text": "【Issue】调用代码读取功能查看非 UTF-8 编码或空文件时，工具容易崩溃，需要检查读取文件的具体实现并改进异常捕获。",
+    "ground_truth": {
+      "target_files": [
+        "src/tools.py"
+      ],
+      "expected_keywords": [
+        "read_file",
+        "FileNotFoundError",
+        "encoding",
+        "utf-8"
+      ],
+      "difficulty": "easy"
+    }
+  },
+  {
+    "id": "eval-03-rag-chunking",
+    "title": "代码语义切块中的重叠窗口计算",
+    "issue_text": "【排查】为了避免函数被切片截断，代码库引入了滑动窗口算法。请帮我定位实现代码切块和计算滑动步长（step）的核心类与函数位置。",
+    "ground_truth": {
+      "target_files": [
+        "src/rag.py"
+      ],
+      "expected_keywords": [
+        "CodeChunker",
+        "chunk_file",
+        "overlap",
+        "step"
+      ],
+      "difficulty": "medium"
+    }
+  },
+  {
+    "id": "eval-04-env-fallback",
+    "title": "环境变量与配置加载容错",
+    "issue_text": "【配置缺陷】当系统缺少 GITHUB_TOKEN 或 LLM 配置时，初始化环节需要有明确的提示与兜底逻辑，请找到负责加载环境参数的代码文件。",
+    "ground_truth": {
+      "target_files": [
+        "src/init_func.py"
+      ],
+      "expected_keywords": [
+        "init_github_token",
+        "init_agent_args",
+        "os.getenv",
+        "load_dotenv"
+      ],
+      "difficulty": "easy"
+    }
+  }
+]
