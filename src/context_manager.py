@@ -49,6 +49,9 @@ def _msg_role(msg: Any) -> str:
 COMPONENTS = ("system_prompt", "tools_schema", "issue", "tool_outputs", "history")
 
 
+COMPRESS_THRESHOLD = 4000  # tool_outputs 超过此估算 token 数才触发
+SNIPPET_CHARS = 150        # 摘要长度
+
 class ContextAccountant:
     """每轮上下文账单:snapshot() 在发送前调用,record() 在响应后调用。"""
 
@@ -94,3 +97,38 @@ class ContextAccountant:
             print(f"  {comp:<15} ~{int(bill.get(comp, 0) * scale):>7,}")
         if true_total > self.input_budget * 0.9:
             print("  ⚠️ 接近预算上限,较早的工具输出将被 Ollama 静默挤出窗口")
+
+    def compress(self) -> int:
+        """B3:发送前把旧工具输出降级为摘要。返回节省的估算 token 数。"""
+        tool_idxs = [i for i, m in enumerate(self.messages) if _msg_role(m) == "tool"]
+        if not tool_idxs:
+            return 0
+        total = sum(estimate_tokens(_msg_content(self.messages[i])) for i in tool_idxs)
+        if total <= COMPRESS_THRESHOLD:
+            return 0
+
+        # 尾部连续的 tool 消息块 = 最近一轮(并行调用会是多个),保持全文
+        last_block: set[int] = set()
+        for i in range(len(self.messages) - 1, -1, -1):
+            if _msg_role(self.messages[i]) == "tool":
+                last_block.add(i)
+            elif last_block:
+                break
+
+        saved = 0
+        for i in tool_idxs:
+            if i in last_block:
+                continue
+            msg = self.messages[i]
+            content = _msg_content(msg)
+            if len(content) <= SNIPPET_CHARS * 4:  # 本来就小,不值得动
+                continue
+            summary = content[:SNIPPET_CHARS].replace("\n", " ")
+            new = (f"[已压缩:原约 {estimate_tokens(content)} token。摘要: {summary}... "
+                   f"需要完整内容请重新调用该工具]")
+            saved += estimate_tokens(content) - estimate_tokens(new)
+            msg["content"] = new  # dict 直改,配对不受影响
+
+        if saved:
+            print(f"[B3 压缩] 旧工具输出降级,节省 ~{saved:,} token(最近一轮保持全文)")
+        return saved

@@ -18,7 +18,7 @@ import time
 
 
 class Agent:
-    DEFAULT_SYSTEM_PROMPT = """你是一名资深代码排查专家。根据用户提供的 GitHub Issue，你可以自主使用工具（list_files、read_file、search_code 关键字精确搜索、search_code_semantic 自然语言语义检索）探索代码库。
+    DEFAULT_SYSTEM_PROMPT = """你是一名资深代码排查专家。根据用户提供的 GitHub Issue，你可以自主使用工具(list_files、read_file、grep 正则精确搜索、search_code_semantic 自然语言语义检索)探索代码库。
     排查完毕后，请务必按照以下 Markdown 格式给出最终结论：
 
     ## 1. 根因分析 (Root Cause Analysis)
@@ -88,7 +88,8 @@ class Agent:
 
         for round_idx in range(1,max_rounds+1):
 
-            accountant.snapshot()  # 发送前:本地估算各成分占比
+            accountant.compress()  # B3:先压缩旧工具输出
+            accountant.snapshot()  # 再记账(压缩后)
 
             response = self.client.chat.completions.create(
                 model = self.model,

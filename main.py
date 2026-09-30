@@ -30,6 +30,8 @@ def main():
     target = sys.argv[1]
     print(f"--> 正在解析目标: {target}")
 
+    use_rewoo = "--rewoo" in sys.argv
+
     github_token = init_github_token()
     result_issue = handle_url(target,github_token)
 
@@ -39,16 +41,22 @@ def main():
     client = OpenAI(
         base_url=base_url,
         api_key=api_key
+
+
     )
 
     # 在创建 Agent 实例时指定客户端和模型名称
-    agent = Agent(
-        client=client,
-        model=model_name,
-        max_tokens = 32768
-    )
+    if use_rewoo:
+        from src.rewoo import ReWOOAgent
+        from src.tools import registry as default_registry
+        agent = ReWOOAgent(
+            client=client, model=model_name,
+            registry=default_registry,
+            solve_system=Agent.DEFAULT_SYSTEM_PROMPT,  # Agent 顶部已导入,直接用
+        )
+    else:
+        agent = Agent(client=client, model=model_name, max_tokens=32768)
 
-
-    print(agent.run(result_issue,20))
+    print(agent.run(result_issue, 20))
 if __name__ == "__main__":
     main()
