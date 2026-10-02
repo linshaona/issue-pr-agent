@@ -1,9 +1,12 @@
 import os
 import inspect
+import json
+import time
 from pydantic import create_model
 from src.rag import CodeChunker, CodebaseRetriever
 import shutil
 import subprocess
+import requests
 
 
 def generate_schema(func,description : str = None)->dict:
@@ -56,6 +59,13 @@ class ToolRegistry:
         if name not in self._tools:
             return f"Error:Tool '{name} not found'"
         try:
+            # schema 键过滤:丢弃模型幻觉出的未知参数(如 block=True),防 TypeError
+            # 对 ReAct/ReWOO/物化三条调用路径统一生效
+            schema = next((s for s in self._schemas
+                           if s["function"]["name"] == name), None)
+            if schema and isinstance(args, dict):
+                allowed = set(schema["function"]["parameters"].get("properties", {}))
+                args = {k: v for k, v in args.items() if k in allowed}
             func = self._tools[name]
             exec_result = func(**args)
             if isinstance(exec_result, list):
@@ -135,6 +145,218 @@ def read_file(file_path: str, offset: int = 0) -> str:
         return f"错误: '{file_path}' 是一个目录，不能用 read_file 读取，请使用 list_files 查看。"
     except Exception as e:
         return f"错误: 读取文件 '{file_path}' 失败: {str(e)}"
+
+
+@registry.register
+def edit_file(file_path: str, old_text: str, new_text: str) -> str:
+    """精确替换文件中的一段文本。old_text 必须与文件现有内容完全一致
+    (建议从 read_file 输出中原样复制)。失败不产生任何修改。
+
+    :param file_path: 目标文件相对路径
+    :param old_text: 要被替换的原文(必须精确且唯一)
+    :param new_text: 替换后的新文本
+    :return: 修改结果描述;失败返回带原因的错误信息
+    """
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+    except FileNotFoundError:
+        return f"错误: 文件 '{file_path}' 不存在。先用 read_file 确认内容再编辑。"
+
+    count = content.count(old_text)
+    if count == 0:
+        return f"错误: 在 '{file_path}' 中未找到 old_text,未做任何修改。请用 read_file 核对原文。"
+    if count > 1:
+        return f"错误: old_text 出现 {count} 次,无法唯一定位。请扩大上下文(多含几行)再试。"
+
+    new_content = content.replace(old_text, new_text, 1)
+    with open(file_path, "w", encoding="utf-8") as f:
+        f.write(new_content)
+    return f"已修改 '{file_path}':替换 1 处({len(old_text)} → {len(new_text)} 字符)。"
+
+
+# 验证门取证文件:run_tests 每次执行都追加一条,verify() 以此为 block 级证据
+TEST_RECORD_PATH = "data/test_runs.jsonl"
+
+@registry.register
+def run_tests(command: str = "pytest -x -q", timeout: int = 120) -> str:
+    """运行项目的测试命令,把执行结果写入取证记录(验证门据此判定)。
+    返回退出码与输出尾部。block 级检查依据:必须真实执行且退出码为 0。
+
+    :param command: 测试命令,默认 pytest -x -q
+    :param timeout: 超时秒数,默认 120
+    :return: 'exit_code=N' 与输出尾部
+    """
+    started = time.time()
+    try:
+        proc = subprocess.run(command, shell=True, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace",
+                              timeout=timeout)
+        exit_code = proc.returncode
+        tail = ((proc.stdout or "") + (proc.stderr or ""))[-1500:]
+    except subprocess.TimeoutExpired:
+        exit_code, tail = -1, f"[超时 {timeout}s,已终止]"
+
+    record = {"time": time.strftime("%Y-%m-%d %H:%M:%S"), "command": command,
+              "exit_code": exit_code,
+              "duration": round(time.time() - started, 1)}
+    os.makedirs(os.path.dirname(TEST_RECORD_PATH), exist_ok=True)
+    with open(TEST_RECORD_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+    status = "✅" if exit_code == 0 else "❌"
+    return f"{status} exit_code={exit_code} ({record['duration']}s)\n{tail}"
+
+
+# ---------- git 工作流(切片6:分支优先,红线防御写在工具里而非提示词里) ----------
+
+def _git(*args: str) -> tuple[int, str]:
+    """git 子进程统一封装:list 形式参数(不经 shell,防注入),返回 (exit_code, 合并输出)"""
+    git = shutil.which("git")
+    if git is None:
+        return -1, "错误: 未找到 git"
+    proc = subprocess.run([git, *args], capture_output=True, text=True,
+                          encoding="utf-8", errors="replace", timeout=60)
+    out = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    return proc.returncode, out
+
+
+@registry.register
+def create_branch(branch_name: str) -> str:
+    """从当前状态创建并切换到新分支。所有改动必须发生在分支上。
+
+    :param branch_name: 新分支名,如 'fix/issue-6000-params-unpack'
+    """
+    code, out = _git("checkout", "-b", branch_name)
+    if code != 0:
+        return f"错误: 创建分支失败(分支可能已存在)。\n{out}"
+    # 提交卫生:测试取证(data/)与字节码缓存(__pycache__)由 run_tests 产生,
+    # 写进本地排除(.git/info/exclude 不入库),防止 git add -A 把它们带进 PR
+    with open(os.path.join(".git", "info", "exclude"), "a", encoding="utf-8") as f:
+        f.write("\n__pycache__/\ndata/\n")
+    return f"✅ 已创建并切换到分支 '{branch_name}'。"
+
+
+@registry.register
+def commit_changes(message: str) -> str:
+    """暂存全部改动并提交到当前分支。禁止直接提交到 main/master。
+
+    :param message: 提交信息
+    """
+    code, branch = _git("branch", "--show-current")
+    if code != 0:
+        return f"错误: 无法读取当前分支。\n{branch}"
+    if branch.strip() in ("main", "master"):
+        return (f"错误: 当前在受保护分支 '{branch.strip()}',拒绝提交。"
+                f"请先用 create_branch 创建工作分支。")
+    code1, out1 = _git("add", "-A")
+    if code1 != 0:
+        return f"错误: git add 失败。\n{out1}"
+    code2, out2 = _git("commit", "-m", message)
+    if code2 != 0:
+        return f"错误: git commit 失败(可能没有可提交的改动)。\n{out2}"
+    return f"✅ 已提交到分支 '{branch.strip()}':\n{out2}"
+
+
+@registry.register
+def push_branch(branch_name: str) -> str:
+    """推送分支到远端 origin。需要已配置推送凭据(HTTPS token 或 SSH)。
+
+    :param branch_name: 要推送的分支名
+    """
+    code, out = _git("push", "-u", "origin", branch_name)
+    if code != 0:
+        return f"错误: 推送失败(检查凭据与远端配置)。\n{out}"
+    return f"✅ 分支 '{branch_name}' 已推送到 origin。"
+
+
+def _create_pr_on_github(title: str, body: str, head_branch: str,
+                         base_branch: str, owner: str, repo: str) -> str:
+    """真正调用 GitHub API 创建 PR(内部函数,不是注册工具——唯一入口是 request_pr)"""
+    from src.init_func import init_github_token
+    token = init_github_token()
+    resp = requests.post(
+        f"https://api.github.com/repos/{owner}/{repo}/pulls",
+        headers={"Authorization": f"Bearer {token}",
+                 "Accept": "application/vnd.github+json"},
+        json={"title": title, "body": body, "head": head_branch, "base": base_branch},
+        timeout=30)
+    if resp.status_code == 201:
+        return f"✅ PR 已创建: {resp.json().get('html_url')}"
+    if resp.status_code == 422:
+        # 正常业务返回,不是异常:给模型可执行的下一步
+        msg = resp.json().get("message", "")
+        return (f"未创建: GitHub 返回 422({msg})。常见原因:该分支已有开放 PR,"
+                f"或 head 与 base 之间没有差异。")
+    return f"错误: GitHub API 返回 {resp.status_code}。\n{resp.text[:300]}"
+
+
+def _read_test_records(path: str = TEST_RECORD_PATH) -> list[dict]:
+    if not os.path.exists(path):
+        return []
+    records = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+    return records
+
+
+def _open_pr_exists(owner: str, repo: str, head_branch: str) -> bool | None:
+    """查询该分支是否已有开放 PR;查询失败返回 None(状态未知,交由门降级处理)"""
+    try:
+        from src.init_func import init_github_token
+        token = init_github_token()
+        resp = requests.get(
+            f"https://api.github.com/repos/{owner}/{repo}/pulls",
+            headers={"Authorization": f"Bearer {token}",
+                     "Accept": "application/vnd.github+json"},
+            params={"head": f"{owner}:{head_branch}", "state": "open"},
+            timeout=30)
+        if resp.status_code == 200:
+            return len(resp.json()) > 0
+    except requests.RequestException:
+        pass
+    return None
+
+
+@registry.register
+def request_pr(title: str, body: str, head_branch: str,
+               base_branch: str = "main", owner: str = "", repo: str = "") -> str:
+    """创建 PR 的唯一入口,内建确定性验证门:测试未通过/空 diff/受保护分支/
+    重复 PR 一律拒绝,门不依赖模型自觉,无法被对话绕过。
+
+    :param title: PR 标题
+    :param body: PR 描述(放置根因分析报告)
+    :param head_branch: 源分支(包含你的改动)
+    :param base_branch: 目标分支,默认 main
+    :param owner: 仓库属主(来自解析的 issue)
+    :param repo: 仓库名
+    """
+    if not owner or not repo:
+        return "错误: 需要提供 owner 和 repo(从解析 issue 的仓库信息中获得)。"
+
+    from src.verify_gate import verify
+    code, branch = _git("branch", "--show-current")
+    branch = branch.strip() if code == 0 else ""
+    code, diff_stat = _git("diff", "--stat", f"{base_branch}...HEAD")
+    test_records = _read_test_records()
+    dup = _open_pr_exists(owner, repo, head_branch)
+
+    verdict = verify(test_records=test_records, branch=branch or head_branch,
+                     diff_stat=diff_stat, dup_pr_exists=dup)
+    if not verdict["passed"]:
+        lines = [f"⛔ 验证门拒绝开 PR({verdict['summary']}):"]
+        lines += [f"  - [{f['severity']}] {f['check']}: {f['detail']}"
+                  for f in verdict["findings"]]
+        lines.append("修复上述问题后重新调用 request_pr。")
+        return "\n".join(lines)
+
+    return _create_pr_on_github(title, body, head_branch, base_branch, owner, repo)
 
 
 

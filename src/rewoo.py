@@ -3,6 +3,7 @@ Planner 一次产出计划 → Worker 纯代码执行(0 次模型调用)→ Solv
 模型在环次数 = 2,与节点数无关。
 """
 import json
+import os
 import re
 import time
 from typing import Any
@@ -22,13 +23,16 @@ class Plan(BaseModel):
     nodes: list[PlanNode]
 
 
-PLANNER_SYSTEM = """你是一名代码排查计划器。根据 GitHub Issue 描述,产出一份用现有工具完成排查的计划。
+PLANNER_SYSTEM = """你是一名代码排查计划器。根据 GitHub Issue 描述,产出一份用现有工具完成排查或修复的计划。
 规则:
 1. 只能使用工具目录中列出的工具;
-2. 节点 id 依次为 E1、E2、…;后面的节点参数里可用 "#E1" 占位符引用前面节点的完整输出;
-3. 先检索定位(search_code_semantic / grep),再读取文件(read_file);不要猜测文件路径;
-4. 节点数不超过 8;计划要产出足以撰写根因报告的证据;
-5. 只输出 JSON,格式: {"nodes": [{"id":"...","tool":"...","args":{},"why":"..."}]}"""
+2. 节点 id 依次为 E1、E2,…;后面的节点参数里可用 "#E1" 占位符引用前面节点的完整输出;
+3. 分析类任务:先检索定位(search_code_semantic / grep),再读取文件(read_file);不要猜测文件路径;
+4. 修复类任务的标准链:create_branch 建工作分支 → read_file 确认原文 → edit_file 修改
+   (edit_file 节点只需给 file_path;old_text/new_text 一律留空字符串,不要抄写原文——
+   执行阶段会基于 read_file 的证据自动物化填充,计划器抄带引号的原文极易产出非法 JSON)→
+   run_tests 验证 → request_pr 交付(owner/repo/分支名按 issue 说明填写);
+5. 节点数不超过 8;只输出 JSON,格式: {"nodes": [{"id":"...","tool":"...","args":{},"why":"..."}]}"""
 
 # 占位符替换:递归处理 args 里的 "#E1"
 def _substitute(value: Any, evidence: dict[str, str]) -> Any:
@@ -56,6 +60,18 @@ def _validate(plan: Plan, registry: ToolRegistry, max_nodes: int) -> str | None:
     return None
 
 
+# B策略:写类工具的参数依赖证据,执行前强制物化(读类工具直接执行)
+WRITE_TOOLS = {"edit_file", "request_pr"}
+
+MATERIALIZE_SYSTEM = """你是参数物化器。给定任务、计划、已收集证据和待执行节点,
+基于**真实证据**输出该节点的最终参数。
+铁律:
+1. 保留当前参数中的全部必需键(如 file_path),除非证据证明其错误;
+2. old_text/new_text 从证据**逐字符复制**——含引号风格、缩进;禁止凭 issue 臆测;
+   字符串值本身不要再包裹额外引号;
+3. 只输出一个 JSON 对象,即完整最终 args。"""
+
+
 class ReWOOAgent:
     """与 Agent 同接口(run/double last_trajectory),评测代码零改动"""
 
@@ -72,13 +88,66 @@ class ReWOOAgent:
         resp = self.client.chat.completions.create(
             model=self.model,
             max_tokens=32768,
+            temperature=0.2,   # 结构化任务钉低温度:方差是 4B 规划器的头号敌人
             messages=[{"role": "system", "content": system},
                       {"role": "user", "content": user}],
         )
         tokens = resp.usage.total_tokens if resp.usage else 0
         msg = resp.choices[0].message
         content = msg.content or getattr(msg, "reasoning", "") or ""
-        return content, tokens
+        # 思考模型偶发把 <think> 内联进 content:剥掉,防止干扰 JSON 定位
+        return re.sub(r"<think>.*?</think>", "", content, flags=re.S).strip(), tokens
+
+    def _materialize_args(self, node, issue_text: str, plan, evidence: dict,
+                          base_args: dict) -> tuple[dict, int]:
+        """B策略:写类工具执行前,让模型看着真实证据补全参数(P14/L2 Exercise 2)。
+        合并语义:Planner 的 substitute 后参数为底座,模型输出覆盖同名键——
+        这样 file_path 等未提及的键不会丢。硬校验失败向上抛,调用方降级。"""
+        evidence_text = "\n\n".join(f"[{nid}] {ev[:2000]}"
+                                    for nid, ev in evidence.items())
+        # schema 必须先取再拼 prompt(上一轮的 UnboundLocalError 教训)
+        schema = next(s for s in self.registry.get_schemas()
+                      if s["function"]["name"] == node.tool)
+        node_schema = schema["function"]
+        prompt = (f"{issue_text}\n\n完整计划:\n"
+                  f"{json.dumps([n.model_dump() for n in plan.nodes], ensure_ascii=False)}\n\n"
+                  f"已收集证据:\n{evidence_text}\n\n"
+                  f"待执行节点 {node.id}(工具 {node.tool})。\n"
+                  f"当前参数(必须全部保留,除非证据表明其错误):\n"
+                  f"{json.dumps(base_args, ensure_ascii=False)}\n"
+                  f"该工具的参数 schema(键名必须与此完全一致,required 中的键一个不能少):\n"
+                  f"{json.dumps(node_schema['parameters'], ensure_ascii=False)}\n"
+                  f"请基于证据输出**完整的最终 args**。")
+        args_text, tokens = self._chat(MATERIALIZE_SYSTEM, prompt)
+        body = args_text[args_text.index("{"): args_text.rindex("}") + 1]
+        # strict=False:容忍 4B 模型把真实换行符直接写进 JSON 字符串(不转义)
+        model_args = json.loads(body, strict=False)
+        # 轻校验:只保留工具 schema 声明过的参数键,幻觉键直接丢弃
+        allowed = set(node_schema["parameters"].get("properties", {}))
+        model_args = {k: v for k, v in model_args.items() if k in allowed}
+        merged = {**base_args, **model_args}
+        # required 键硬校验:缺一个就降级,不带病执行
+        for req in node_schema["parameters"].get("required", []):
+            if req not in merged or str(merged[req]).strip() == "":
+                raise ValueError(f"物化结果缺少必需参数 '{req}'")
+        # 硬校验:edit_file 的 old_text 不得为空——空串会静默匹配失败,不如现在就降级
+        if node.tool == "edit_file" and not str(merged.get("old_text", "")).strip():
+            raise ValueError("物化结果 old_text 为空")
+        # 确定性护栏:file_path 必须真实存在;模型指错文件时回退 Planner 的值
+        if "file_path" in merged and "file_path" in base_args:
+            if not os.path.exists(merged["file_path"]) and os.path.exists(base_args["file_path"]):
+                merged["file_path"] = base_args["file_path"]
+        # 缩进保持护栏:old_text 末行有缩进而 new_text 丢失时,按原缩进对齐
+        # (真实故障:物化模型抄了缩进进 old_text,却在 new_text 里弄丢,产生 IndentationError)
+        if node.tool == "edit_file":
+            old_lines = str(merged.get("old_text", "")).splitlines()
+            new_lines = str(merged.get("new_text", "")).splitlines()
+            if old_lines and new_lines:
+                old_indent = old_lines[-1][:len(old_lines[-1]) - len(old_lines[-1].lstrip())]
+                if old_indent and new_lines[-1].strip() and not new_lines[-1].startswith(old_indent):
+                    merged["new_text"] = "\n".join(
+                        (old_indent + ln if ln.strip() else ln) for ln in new_lines)
+        return merged, tokens
 
     def run(self, input_text: str, max_rounds: int = 10) -> str:   # 签名兼容 main.py
         start = time.time()
@@ -86,39 +155,57 @@ class ReWOOAgent:
         total_tokens = 0
 
         # ---------- Planner ----------
-        catalog = "\n".join(f"- {s['function']['name']}: "
-                            f"{s['function'].get('description', '')[:80]}"
-                            for s in self.registry.get_schemas())
+        # 工具目录必须带参数名:描述截断会让模型瞎编键名(如 cmd vs command)
+        catalog = "\n".join(
+            f"- {s['function']['name']}"
+            f"({', '.join(s['function']['parameters'].get('properties', {}).keys())}): "
+            f"{s['function'].get('description', '')[:100]}"
+            for s in self.registry.get_schemas())
         plan_text, tokens = self._chat(
             PLANNER_SYSTEM, f"{input_text}\n\n工具目录:\n{catalog}")
         total_tokens += tokens
 
         plan: Plan | None = None
-        for _ in range(2):                                  # 解析/验证失败带错重试
+        err = ""
+        for attempt in range(3):                            # 3 次尝试:先解析手头输出,不合格才重试
             try:
                 body = plan_text[plan_text.index("{"): plan_text.rindex("}") + 1]
-                plan = Plan.model_validate_json(body)
+                # strict=False:容忍模型把真实换行符写进 JSON 字符串
+                candidate = Plan.model_validate(json.loads(body, strict=False))
             except (ValueError, ValidationError) as e:
                 err = f"JSON 不合格: {e}"
             else:
-                err = _validate(plan, self.registry, self.max_nodes)
+                err = _validate(candidate, self.registry, self.max_nodes)
                 if err is None:
+                    plan = candidate
                     break
-            plan_text, tokens = self._chat(
-                PLANNER_SYSTEM + f"\n\n上次输出不合格:{err}。请重新只输出 JSON。",
-                f"{input_text}\n\n工具目录:\n{catalog}")
-            total_tokens += tokens
+            print(f"[Planner 重试] 第{attempt + 1}次输出不合格: {err} | 前200字: {plan_text[:200]}")
+            if attempt < 2:
+                plan_text, tokens = self._chat(
+                    PLANNER_SYSTEM + f"\n\n上次输出不合格:{err}。请重新只输出 JSON。",
+                    f"{input_text}\n\n工具目录:\n{catalog}")
+                total_tokens += tokens
         if plan is None:
-            self.last_trajectory.final_report = "⚠️ Planner 两次未能产出合格计划"
+            self.last_trajectory.final_report = "⚠️ Planner 3 次未能产出合格计划"
             self.last_trajectory.total_rounds = 1
             return self.last_trajectory.final_report
         print(f"[Planner] {len(plan.nodes)} 个节点: "
               + " → ".join(f"{n.id}:{n.tool}" for n in plan.nodes))
 
-        # ---------- Worker(0 次模型调用,B2 截断自动生效)----------
+        # ---------- Worker(读节点 0 次模型调用;写节点先物化 args)----------
         evidence: dict[str, str] = {}
+        n_materialized = 0
         for node in plan.nodes:
             args = _substitute(node.args, evidence)
+            if node.tool in WRITE_TOOLS:                    # B策略触发器
+                try:
+                    args, mtokens = self._materialize_args(node, input_text, plan,
+                                                           evidence, base_args=args)
+                    total_tokens += mtokens
+                    n_materialized += 1
+                    print(f"[物化 {node.id}] args 已基于证据补全: {args}")
+                except Exception as e:
+                    print(f"[物化失败 {node.id}] 回退占位符参数: {e}")
             output = str(self.registry.execute(node.tool, args))
             evidence[node.id] = output
             self.last_trajectory.tool_calls.append(ToolCallRecord(
@@ -139,7 +226,7 @@ class ReWOOAgent:
         total_tokens += tokens
 
         self.last_trajectory.total_tokens = total_tokens
-        self.last_trajectory.total_rounds = 2               # Planner + Solver
+        self.last_trajectory.total_rounds = 2 + n_materialized   # Planner + Solver + 物化
         self.last_trajectory.duration = time.time() - start
         self.last_trajectory.is_timeout = False
         self.last_trajectory.final_report = report
