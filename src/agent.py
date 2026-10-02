@@ -3,6 +3,7 @@ from typing import Any
 from openai import OpenAI
 
 from src.context_manager import Trajectory, ToolCallRecord, ContextAccountant
+from src.permissions import PermissionPolicy
 from src.tools import ToolRegistry, registry as default_registry
 
 import time
@@ -50,12 +51,14 @@ class Agent:
             max_tokens:int = 32768,
             context_windows = 65536,
             last_trajectory : Trajectory | None = None,
+            permission_mode: str = "default",
     ):
 
         self.client = client
         self.model = model
         self.system_prompt = system_prompt or self.DEFAULT_SYSTEM_PROMPT
         self.registry = registry or default_registry
+        self.policy = PermissionPolicy(mode=permission_mode)
         self.tools_schema = self.registry.get_schemas()
         #self.tools_schema = tools_schema or self.registry.get_schemas()
         self.messages: list[dict[str, Any]] = []
@@ -138,7 +141,17 @@ class Agent:
 
                     print(f"调用工具{func_name},参数{func_args}\n")
 
-                    tool_output = self.registry.execute(func_name, func_args)
+                    # L10 PVE:execute 之前过权限策略(模式×类别×注射×预算);
+                    # 拒绝消息作为工具输出回传,模型可以换路线,但世界未被触碰
+                    verdict = self.policy.check(
+                        func_name, func_args,
+                        tokens_so_far=self.last_trajectory.total_tokens)
+                    if verdict["allowed"]:
+                        tool_output = self.registry.execute(func_name, func_args)
+                    else:
+                        tool_output = f"错误: 权限策略拒绝 {func_name}:{verdict['reason']}"
+                        print(f"⛔ [权限策略|{self.policy.mode}] {func_name} 被拒: {verdict['reason']}")
+                    self.policy.observe(func_name, func_args, str(tool_output))  # L14 回喂
 
                     self.last_trajectory.tool_calls.append(
                         ToolCallRecord(

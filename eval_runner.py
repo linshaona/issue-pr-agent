@@ -8,6 +8,8 @@ from src.agent import Agent
 from src.init_func import init_agent_args
 from src.eval import Scorer, EvalResult
 from src.failure_tags import tag as tag_failure_modes
+from src.reviewer import review as run_review
+from src.observability import export_run, summarize, print_summary
 
 DATASET_PATH = "data/eval_dataset.json"
 
@@ -146,6 +148,7 @@ def main():
 
     all_results: dict[str, list[EvalResult]] = {}
     all_tags: dict[str, list[dict]] = {}
+    all_reviews: dict[str, list[dict]] = {}
     from src.tools import registry as default_registry   # 标签器要查 schema
 
     for idx, case in enumerate(dataset, 1):
@@ -163,10 +166,22 @@ def main():
             new_records = _test_records_upto()[records_before:]
             tags = tag_failure_modes(agent.last_trajectory, default_registry, new_records)
             all_tags.setdefault(case["id"], []).append(tags)
+            # L39 评审:建造者/评分者分离,五维量规定性裁决(门管事实,评审管判断)
+            try:
+                review = run_review(client, model_name, case["issue_text"],
+                                    agent.last_trajectory, new_records)
+            except Exception as e:
+                review = {"verdict": "review_error", "total": -1,
+                          "verdict_reason": str(e)[:120]}
+            all_reviews.setdefault(case["id"], []).append(review)
+            # L13 可观测:OTel GenAI 风格轨迹落盘
+            export_run(case["id"], "rewoo" if args.rewoo else "react",
+                       agent.last_trajectory, result, tags, agent.policy)
             mode_note = f" ⚠️ {','.join(tags['modes'])}" if tags["modes"] else ""
+            review_note = f" 🔎 {review['verdict']}({review['total']}/10)"
             print(f"    run {run_idx}/{args.runs}: {result.reason} "
                   f"(轮数: {result.rounds}, token: {result.tokens}, {result.duration:.1f}s)"
-                  f"{mode_note}")
+                  f"{mode_note}{review_note}")
 
         all_results[case["id"]] = case_results
 
@@ -176,6 +191,7 @@ def main():
     else:
         print_stability_report(all_results)
     print_failure_report(all_tags)
+    print_summary(summarize())
 
 
 if __name__ == "__main__":

@@ -52,9 +52,13 @@ def cascade_radius(traj: Trajectory) -> int:
 
 def success_hallucination(traj: Trajectory, test_records: list[dict]) -> bool:
     """成功幻觉:报告自称成功,但测试证据缺失或末次 exit≠0。
-    L26 核心命题的反面取证——"完成"必须由环境状态背书,而非模型自述。"""
+    L26 核心命题的反面取证——"完成"必须由环境状态背书,而非模型自述。
+    护栏:轨迹里没有 run_tests 调用视为分析类任务(本就无测试可证),
+    不打此标签——真实故障:eval-03 的纯定位任务被误报(2026-10-02)。"""
     report = traj.final_report or ""
     if not any(mark in report for mark in SUCCESS_MARKS):
+        return False
+    if not any(c.name == "run_tests" for c in traj.tool_calls):
         return False
     if not test_records:
         return True                              # 自称成功却没有任何测试取证
