@@ -127,9 +127,10 @@ class ReWOOAgent:
                   f"{json.dumps(node_schema['parameters'], ensure_ascii=False)}\n"
                   f"请基于证据输出**完整的最终 args**。")
         args_text, tokens = self._chat(MATERIALIZE_SYSTEM, prompt)
-        body = args_text[args_text.index("{"): args_text.rindex("}") + 1]
-        # strict=False:容忍 4B 模型把真实换行符直接写进 JSON 字符串(不转义)
-        model_args = json.loads(body, strict=False)
+        # raw_decode 取第一个完整 JSON 对象:4B 偶发输出两个对象/尾随文本
+        # (实测故障:"Extra data: line 6 column 1")
+        model_args, _ = json.JSONDecoder(strict=False).raw_decode(
+            args_text[args_text.index("{"):])
         # 轻校验:只保留工具 schema 声明过的参数键,幻觉键直接丢弃
         allowed = set(node_schema["parameters"].get("properties", {}))
         model_args = {k: v for k, v in model_args.items() if k in allowed}
@@ -177,9 +178,11 @@ class ReWOOAgent:
         err = ""
         for attempt in range(3):                            # 3 次尝试:先解析手头输出,不合格才重试
             try:
-                body = plan_text[plan_text.index("{"): plan_text.rindex("}") + 1]
-                # strict=False:容忍模型把真实换行符写进 JSON 字符串
-                candidate = Plan.model_validate(json.loads(body, strict=False))
+                # raw_decode 取第一个完整 JSON 对象(容忍尾随文本/双对象)
+                parsed, _ = json.JSONDecoder(strict=False).raw_decode(
+                    plan_text[plan_text.index("{"):])
+                # strict=False 由 JSONDecoder 承担:容忍模型把真实换行符写进字符串
+                candidate = Plan.model_validate(parsed)
             except (ValueError, ValidationError) as e:
                 err = f"JSON 不合格: {e}"
             else:
@@ -222,6 +225,8 @@ class ReWOOAgent:
                 output = f"错误: 权限策略拒绝 {node.tool}:{verdict['reason']}"
                 print(f"⛔ [权限策略|{self.policy.mode} {node.id}] {node.tool} 被拒: {verdict['reason']}")
             self.policy.observe(node.tool, args, output)  # L14 回喂:熔断器数模式,canary 扫输出
+            # 逐节点回写累计 token:Web 端/观测方可以在运行中读到实时值
+            self.last_trajectory.total_tokens = total_tokens
             evidence[node.id] = output
             self.last_trajectory.tool_calls.append(ToolCallRecord(
                 round=int(node.id[1:]) if node.id[1:].isdigit() else 0,

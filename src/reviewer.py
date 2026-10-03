@@ -56,7 +56,8 @@ def build_inputs(trajectory, test_records: list[dict]) -> dict:
 
 def review(client, model: str, issue_text: str, trajectory,
            test_records: list[dict]) -> dict:
-    """评审一次运行。LLM 打各维分数,总分与裁决由代码确定性重算。"""
+    """评审一次运行。LLM 打各维分数,总分与裁决由代码确定性重算。
+    解析失败带错重试一次(4B 思考模型偶发纯思考无 JSON——Planner 同款教训)。"""
     artifacts = build_inputs(trajectory, test_records)
     user = (f"【任务(issue 原文)】\n{issue_text[:1200]}\n\n"
             f"【建造者的编辑】\n{json.dumps(artifacts['edits'], ensure_ascii=False)}\n\n"
@@ -64,16 +65,30 @@ def review(client, model: str, issue_text: str, trajectory,
             f"【测试证据】\n{json.dumps(artifacts['test_evidence'], ensure_ascii=False)}\n\n"
             f"【建造者的最终报告(前1500字)】\n{artifacts['final_report']}\n\n"
             f"请按量规输出 JSON。")
-    resp = client.chat.completions.create(
-        model=model,
-        max_tokens=2048,
-        temperature=0.2,
-        messages=[{"role": "system", "content": REVIEWER_SYSTEM},
-                  {"role": "user", "content": user}])
-    msg = resp.choices[0].message
-    body = (msg.content or getattr(msg, "reasoning", "") or "")
-    body = body[body.index("{"): body.rindex("}") + 1]
-    data = json.loads(body, strict=False)
+
+    data, tokens = None, 0
+    last_err = ""
+    for attempt in range(2):
+        resp = client.chat.completions.create(
+            model=model,
+            max_tokens=2048,
+            temperature=0.2,
+            messages=[{"role": "system",
+                       "content": REVIEWER_SYSTEM + (f"\n\n上次输出不合格:{last_err}。"
+                                                     "请重新只输出一个 JSON 对象。" if attempt else "")},
+                      {"role": "user", "content": user}])
+        tokens += resp.usage.total_tokens if resp.usage else 0
+        msg = resp.choices[0].message
+        body = (msg.content or getattr(msg, "reasoning", "") or "")
+        try:
+            # raw_decode 取第一个完整 JSON 对象:4B 偶发输出两个对象/尾随文本
+            # (实测故障:"Extra data"——loads 抓 first{..last} 会把两个对象串成非法体)
+            data, _ = json.JSONDecoder(strict=False).raw_decode(body[body.index("{"):])
+            break
+        except ValueError as e:
+            last_err = f"JSON 不合格: {e}"
+    if data is None:
+        raise ValueError(f"评审员两次未能产出合格 JSON: {last_err}")
 
     # 确定性重算:分数钳位到 0-2,总分自己加,裁决自己下
     scores = {}
@@ -97,5 +112,5 @@ def review(client, model: str, issue_text: str, trajectory,
         "confidence_min": min(confidence.values()),
         "low_confidence": min(confidence.values()) < CONFIDENCE_FLOOR,
         "reviewed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-        "review_tokens": resp.usage.total_tokens if resp.usage else 0,
+        "review_tokens": tokens,
     }

@@ -61,19 +61,27 @@ def _check_command(command: str) -> dict | None:
     return None
 
 
-def _scan_strings(value, findings: list[str], path: str = "args") -> None:
-    """递归扫描 args 里所有字符串值的注射签名。"""
+# 内容承载参数才做注射扫描;导航性键(file_path/path 等)豁免——
+# 真实教训(2026-10-02 评测):planner 编造的路径恰好含"忽略系统"字样被误拒,
+# 路径是标识符不是内容,注入扫描的对象是会写进世界的内容
+NAVIGATION_KEYS = {"file_path", "path", "directory", "glob", "pattern"}
+
+
+def _scan_strings(value, findings: list[str], path: str = "args",
+                  key: str | None = None) -> None:
+    """递归扫描 args 里内容承载的字符串值的注射签名。"""
     if isinstance(value, str):
-        for pat in INJECTION_PATTERNS:
-            m = pat.search(value)
-            if m:
-                findings.append(f"{path} 含注射签名 '{m.group(0)[:40]}'")
+        if key not in NAVIGATION_KEYS:
+            for pat in INJECTION_PATTERNS:
+                m = pat.search(value)
+                if m:
+                    findings.append(f"{path} 含注射签名 '{m.group(0)[:40]}'")
     elif isinstance(value, dict):
         for k, v in value.items():
-            _scan_strings(v, findings, f"{path}.{k}")
+            _scan_strings(v, findings, f"{path}.{k}", key=k)
     elif isinstance(value, list):
         for i, v in enumerate(value):
-            _scan_strings(v, findings, f"{path}[{i}]")
+            _scan_strings(v, findings, f"{path}[{i}]", key=key)
 
 
 def validate(tool_name: str, args: dict) -> dict:
