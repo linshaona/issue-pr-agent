@@ -1,0 +1,233 @@
+<!doctype html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Issue→PR Agent · 自主编码战术遥测控制台</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+
+  <!-- L14 Emergency Kill Switch Active Banner -->
+  <div id="kill-banner" class="kill-banner">
+    <div style="display:flex;align-items:center;gap:10px">
+      <span style="font-size:18px">🚨</span>
+      <div>
+        <div><strong>KILL SWITCH 已触发 (LIVE LOCKDOWN)</strong> — Agent 的所有后续工具调用将在执行前被确定性拒绝</div>
+        <div id="kstate" style="font-size:11.5px;opacity:0.9">标志文件存在期间，零外部动作会被执行（重开需人工点击右侧「解除封锁」或删除标志文件）</div>
+      </div>
+    </div>
+    <button class="btn btn-ghost btn-sm" style="background:#ffffff;color:#991b1b;border:none;font-weight:700" onclick="setKillSwitch(false)">
+      🔓 人工解除封锁 (Disarm)
+    </button>
+  </div>
+
+  <!-- Top Tactical Command Header -->
+  <header class="top-header">
+    <div class="brand-cluster">
+      <div class="brand-emblem">PR</div>
+      <div class="brand-titles">
+        <h1>
+          <span>Issue→PR Agent</span>
+          <span class="version-tag">v0.3 · TACTICAL DECK</span>
+        </h1>
+        <p class="brand-sub">
+          <span>ReWOO 计划-物化-求解</span>
+          <span>·</span>
+          <span>L10/L14/L27 四层防御</span>
+          <span>·</span>
+          <span>L38 验证门 &amp; L39 五维独立评审</span>
+        </p>
+      </div>
+    </div>
+
+    <!-- Primary Workspace View Switcher -->
+    <nav class="nav-tabs" aria-label="控制台主视图切换">
+      <button class="nav-tab active" data-tab="mission" onclick="switchTab('mission')">
+        <span>🎯</span>
+        <span>任务指挥台</span>
+        <span id="runs-count-badge" class="tab-count">0</span>
+      </button>
+      <button class="nav-tab" data-tab="observability" onclick="switchTab('observability')">
+        <span>📈</span>
+        <span>可观测与历史账本</span>
+      </button>
+      <button class="nav-tab" data-tab="defense" onclick="switchTab('defense')">
+        <span>🛡️</span>
+        <span>四层防御与系统卡</span>
+      </button>
+    </nav>
+
+    <!-- Right Header Telemetry & Kill Switch Controls -->
+    <div class="header-controls">
+      <div id="kstate-pill" class="sys-pill" title="L10/L14 权限策略与三探测器状态">
+        <span class="dot ok"></span>
+        <span>PVE 护栏就绪</span>
+      </div>
+
+      <button id="theme-toggle-btn" class="btn btn-ghost btn-sm" onclick="toggleTheme()" title="切换暗色战术台 / 浅色工程蓝图主题">
+        ☀️ 浅色蓝图
+      </button>
+
+      <div class="killswitch-cluster">
+        <button id="kill-on-btn" class="btn btn-danger btn-sm" onclick="setKillSwitch(true)" title="立即创建标志文件，阻断 Agent 下一个工具调用 (无需重启)">
+          🚨 Kill Switch
+        </button>
+        <button id="kill-off-btn" class="btn btn-ghost btn-sm" style="display:none" onclick="setKillSwitch(false)" title="删除标志文件，恢复 Agent 执行权限">
+          🔓 重开
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- Main Workspace Container -->
+  <main class="workspace-container">
+
+    <!-- ====================================================================
+         VIEW 1: MISSION CONTROL (任务指挥台)
+         ==================================================================== -->
+    <section id="view-mission" class="view-pane active">
+      <div class="mission-grid">
+
+        <!-- Left Column: Task Composer + Session Runs List -->
+        <div style="display:flex;flex-direction:column;gap:18px">
+
+          <!-- Task Composer Panel -->
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">⚡ 派发编码与排查任务</h2>
+              <span class="panel-subtitle">GitHub API / 本地沙箱</span>
+            </div>
+            <div class="panel-body">
+
+              <!-- Preset Selector -->
+              <div class="preset-bar">
+                <div class="preset-group-label">
+                  <span>🎯 快速装填 (基准评测集 / 安全红队探针)</span>
+                </div>
+                <select id="preset-select" class="preset-select" onchange="applyPreset(this.value)">
+                  <option value="">-- 选择基准评测题或安全红队探针一键装填 --</option>
+                </select>
+              </div>
+
+              <!-- Issue Input -->
+              <label class="field-label" for="issue">
+                <span>任务描述 (Issue 正文 / owner/repo#123 / 完整 URL)</span>
+              </label>
+              <textarea
+                id="issue"
+                class="form-textarea"
+                placeholder="输入 GitHub Issue 标识 (如 psf/requests#6000) 或直接粘贴 Bug 描述与排查要求..."
+              ></textarea>
+
+              <!-- Engine, Permission Mode & Max Rounds -->
+              <div class="config-grid">
+                <div>
+                  <label class="field-label" for="mode">执行架构 (Engine)</label>
+                  <select id="mode" class="form-select" onchange="updatePolicyPreview()">
+                    <option value="rewoo">ReWOO (规划-物化-求解)</option>
+                    <option value="react">ReAct (多轮循环推理)</option>
+                  </select>
+                </div>
+                <div>
+                  <label class="field-label" for="pmode">权限档位 (L10 Policy)</label>
+                  <select id="pmode" class="form-select" onchange="updatePolicyPreview()">
+                    <option value="default">default (标准预算)</option>
+                    <option value="plan">plan (只读分析)</option>
+                    <option value="unattended">unattended (紧预算)</option>
+                    <option value="bypass">bypass (容器无帽)</option>
+                  </select>
+                </div>
+              </div>
+
+              <div style="margin-top:8px;display:flex;align-items:center;justify-content:space-between;gap:10px">
+                <label class="field-label" for="max-rounds" style="margin:0">最大思考轮数 / 节点上限</label>
+                <input
+                  id="max-rounds"
+                  type="number"
+                  min="1"
+                  max="40"
+                  value="20"
+                  class="form-input"
+                  style="width:82px;padding:5px 8px;text-align:center;font-family:var(--font-mono)"
+                />
+              </div>
+
+              <!-- Live Policy & Risk Class Preview -->
+              <div id="policy-preview-box" class="policy-preview-box"></div>
+
+              <!-- Submit Button -->
+              <div style="margin-top:14px;display:flex;gap:8px">
+                <button id="submit-btn" class="btn btn-primary" style="flex:1;padding:10px 16px;font-size:13.5px" onclick="submitRun()">
+                  ▶ 提交任务并启动 Agent
+                </button>
+                <button class="btn btn-ghost" style="padding:10px 12px" onclick="seedDemoRun()" title="不调用大模型，秒级注入一条含 ReWOO 节点、代码 Diff 与五维评审的完整演示轨迹">
+                  ✨ 演示轨迹
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Session Runs List Panel -->
+          <div class="panel">
+            <div class="panel-header">
+              <h2 class="panel-title">📡 当前会话运行队列</h2>
+              <div class="filter-pills">
+                <button class="filter-pill active" data-run-filter="all" onclick="setRunFilter('all')">全部</button>
+                <button class="filter-pill" data-run-filter="running" onclick="setRunFilter('running')">运行中</button>
+                <button class="filter-pill" data-run-filter="done" onclick="setRunFilter('done')">已完成</button>
+                <button class="filter-pill" data-run-filter="error" onclick="setRunFilter('error')">异常</button>
+              </div>
+            </div>
+            <div id="runs-list-container" class="runs-list"></div>
+          </div>
+
+        </div>
+
+        <!-- Right Column: Deep Run Telemetry & Trajectory Inspector -->
+        <div id="detail-stage">
+          <div class="panel">
+            <div class="empty-state" style="padding:84px 24px">
+              <div class="empty-icon">🧭</div>
+              <h3 style="margin:0 0 6px;color:var(--text-primary);font-size:15px">等待选择或派发 Agent 运行任务</h3>
+              <p style="margin:0;max-width:460px;font-size:12.5px;line-height:1.6">
+                在左侧面板选择一道<strong>基准评测题</strong>或<strong>安全红队探针</strong>并点击「提交任务」，即可在此实时观测 ReWOO 计划节点、工具调用证据链、L10 权限拦截状态与 L39 独立评审员五维打分。
+              </p>
+              <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;justify-content:center">
+                <button class="btn btn-primary btn-sm" onclick="seedDemoRun()">✨ 一键载入完整演示轨迹 (秒级预览)</button>
+                <button class="btn btn-ghost btn-sm" onclick="switchTab('observability')">📈 查看历史运行账本 (data/runs.jsonl)</button>
+                <button class="btn btn-ghost btn-sm" onclick="switchTab('defense')">🛡️ 检视四层安全防御矩阵</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </section>
+
+    <!-- ====================================================================
+         VIEW 2: OBSERVABILITY & OTEL GENAI LEDGER (可观测与历史账本)
+         ==================================================================== -->
+    <section id="view-observability" class="view-pane">
+      <div id="observability-stage">
+        <div class="panel"><div class="empty-state">正在加载 OpenTelemetry GenAI 历史账本…</div></div>
+      </div>
+    </section>
+
+    <!-- ====================================================================
+         VIEW 3: 4-LAYER DEFENSE STACK & SYSTEM CARD (四层防御与系统卡)
+         ==================================================================== -->
+    <section id="view-defense" class="view-pane">
+      <div id="defense-stage">
+        <div class="panel"><div class="empty-state">正在加载四层安全能力栈与工具风险矩阵…</div></div>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- Toast Notification Container -->
+  <div id="toast-container" class="toast-container"></div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

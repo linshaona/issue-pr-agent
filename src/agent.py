@@ -1,21 +1,12 @@
 import json
+import time
 from typing import Any
+
 from openai import OpenAI
 
 from src.context_manager import Trajectory, ToolCallRecord, ContextAccountant
 from src.permissions import PermissionPolicy
 from src.tools import ToolRegistry, registry as default_registry
-
-import time
-
-
-
-
-
-
-
-
-
 
 
 class Agent:
